@@ -1,148 +1,120 @@
 """
-relay_server.py  –  TCP relay for Android Remote
-=================================================
-Deploy this on Railway (or any server with a public IP).
+relay_server.py  -  WebSocket relay for Android Remote
+=======================================================
+Works on Railway free tier (HTTP/WebSocket only).
 
-Each session has a room ID. Android and PC both connect to this server
-using the same room ID. The server pairs them up and pipes bytes both ways.
+Each client connects via WebSocket and sends a JSON handshake first:
+  {"role": "A" or "P", "channel": "V" or "I", "room": "<room_id>"}
 
-Each "room" needs TWO channel pairs:
-  - video   channel  (Android → PC)
-  - input   channel  (PC → Android)
-
-Connection handshake (first 64 bytes sent by client, null-padded):
-  [1 byte role: 'A'=Android, 'P'=PC] [1 byte channel: 'V'=video, 'I'=input] [62 bytes room ID (ASCII, null padded)]
-
-Once both sides of a channel connect, relay just pipes bytes.
+After handshake, raw bytes are piped between Android and PC.
 """
 
+import asyncio
+import json
 import os
-import socket
-import threading
-from collections import defaultdict
+import websockets
 
-PORT = int(os.environ.get("PORT", 7000))
+PORT = int(os.environ.get("PORT", 8000))
 
-# rooms[room_id][channel] = {'A': socket | None, 'P': socket | None}
-rooms: dict[str, dict[str, dict]] = defaultdict(lambda: {
-    'V': {'A': None, 'P': None, 'lock': threading.Lock()},
-    'I': {'A': None, 'P': None, 'lock': threading.Lock()},
-})
-rooms_lock = threading.Lock()
+# rooms[room_id][channel] = {"A": ws|None, "P": ws|None}
+rooms: dict = {}
+rooms_lock: asyncio.Lock = None  # initialized in main()
 
 
-def pipe(src: socket.socket, dst: socket.socket, label: str):
-    """Forward bytes from src to dst until either closes."""
+def get_or_create_slot(room_id: str, channel: str) -> dict:
+    if room_id not in rooms:
+        rooms[room_id] = {
+            "V": {"A": None, "P": None},
+            "I": {"A": None, "P": None},
+        }
+    return rooms[room_id][channel]
+
+
+async def pipe_ws(src, dst, label: str):
     try:
-        while True:
-            data = src.recv(65536)
-            if not data:
-                break
-            dst.sendall(data)
-    except OSError:
-        pass
-    finally:
-        try: src.close()
-        except: pass
-        try: dst.close()
-        except: pass
-    print(f"[relay] pipe closed: {label}")
+        async for message in src:
+            await dst.send(message)
+    except Exception as e:
+        print(f"[relay] pipe closed: {label} ({e})")
 
 
-def handle_client(conn: socket.socket, addr):
+async def handler(websocket):
+    global rooms_lock
+    addr = websocket.remote_address
+    role = channel = room_id = None
     try:
-        header = b""
-        while len(header) < 64:
-            chunk = conn.recv(64 - len(header))
-            if not chunk:
-                conn.close()
-                return
-            header += chunk
+        raw = await asyncio.wait_for(websocket.recv(), timeout=15)
+        hs  = json.loads(raw)
+        role    = hs["role"]
+        channel = hs["channel"]
+        room_id = hs["room"].strip()
 
-        role    = chr(header[0])    # 'A' or 'P'
-        channel = chr(header[1])    # 'V' or 'I'
-        room_id = header[2:].rstrip(b'\x00').decode('ascii', errors='replace').strip()
-
-        if role not in ('A', 'P') or channel not in ('V', 'I') or not room_id:
-            print(f"[relay] bad header from {addr}: role={role} ch={channel} room={room_id!r}")
-            conn.close()
+        if role not in ("A", "P") or channel not in ("V", "I") or not room_id:
+            await websocket.close(1008, "bad handshake")
             return
 
-        print(f"[relay] {addr}  role={role}  channel={channel}  room={room_id!r}")
+        print(f"[relay] {addr}  role={role}  ch={channel}  room={room_id!r}")
 
-        with rooms_lock:
-            slot = rooms[room_id][channel]
-
-        with slot['lock']:
+        async with rooms_lock:
+            slot = get_or_create_slot(room_id, channel)
             if slot[role] is not None:
-                # Duplicate connection — reject
-                print(f"[relay] duplicate {role}/{channel} for room {room_id!r}, rejecting")
-                conn.close()
+                await websocket.close(1008, "duplicate connection")
                 return
-            slot[role] = conn
+            slot[role] = websocket
 
-        # Wait for the peer to connect (poll — simple and good enough)
-        peer_role = 'P' if role == 'A' else 'A'
-        print(f"[relay] waiting for peer {peer_role}/{channel} in room {room_id!r}")
-        import time
-        for _ in range(300):  # wait up to 30 seconds
-            with slot['lock']:
+        peer_role = "P" if role == "A" else "A"
+
+        # Wait up to 120s for peer
+        for _ in range(1200):
+            async with rooms_lock:
                 peer = slot[peer_role]
             if peer is not None:
                 break
-            time.sleep(0.1)
+            await asyncio.sleep(0.1)
         else:
-            print(f"[relay] timeout waiting for peer in room {room_id!r}")
-            conn.close()
-            with slot['lock']:
+            print(f"[relay] timeout waiting for peer {room_id!r}/{channel}")
+            async with rooms_lock:
                 slot[role] = None
+            await websocket.close(1001, "peer timeout")
             return
 
-        print(f"[relay] pairing {channel} channel in room {room_id!r}")
+        print(f"[relay] pairing {room_id!r}/{channel}")
 
-        with slot['lock']:
-            a_sock = slot['A']
-            p_sock = slot['P']
-            # Clear slot so room can be reused
-            slot['A'] = None
-            slot['P'] = None
+        async with rooms_lock:
+            a_ws = slot["A"]
+            p_ws = slot["P"]
+            slot["A"] = None
+            slot["P"] = None
 
-        # Pipe in both directions concurrently
-        label = f"{room_id}/{channel}"
-        t = threading.Thread(target=pipe, args=(p_sock, a_sock, f"{label} P→A"), daemon=True)
-        t.start()
-        pipe(a_sock, p_sock, f"{label} A→P")
-        t.join()
+        await asyncio.gather(
+            pipe_ws(a_ws, p_ws, f"{room_id}/{channel} A->P"),
+            pipe_ws(p_ws, a_ws, f"{room_id}/{channel} P->A"),
+        )
 
-        # Clean up room if empty
-        with rooms_lock:
+        async with rooms_lock:
             r = rooms.get(room_id)
-            if r:
-                all_empty = all(
-                    r[ch]['A'] is None and r[ch]['P'] is None
-                    for ch in ('V', 'I')
-                )
-                if all_empty:
-                    del rooms[room_id]
-                    print(f"[relay] room {room_id!r} cleaned up")
+            if r and all(r[ch]["A"] is None and r[ch]["P"] is None for ch in ("V", "I")):
+                del rooms[room_id]
+                print(f"[relay] room {room_id!r} cleaned up")
 
     except Exception as e:
-        print(f"[relay] error handling {addr}: {e}")
-        try: conn.close()
+        print(f"[relay] error {addr}: {e}")
+        if role and channel and room_id:
+            async with rooms_lock:
+                try:
+                    rooms[room_id][channel][role] = None
+                except: pass
+        try: await websocket.close()
         except: pass
 
 
-def main():
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", PORT))
-    srv.listen(50)
-    print(f"[relay] listening on 0.0.0.0:{PORT}")
-
-    while True:
-        conn, addr = srv.accept()
-        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+async def main():
+    global rooms_lock
+    rooms_lock = asyncio.Lock()
+    print(f"[relay] WebSocket relay on 0.0.0.0:{PORT}")
+    async with websockets.serve(handler, "0.0.0.0", PORT):
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
