@@ -112,7 +112,7 @@ async def main():
     global rooms_lock
     rooms_lock = asyncio.Lock()
     print(f"[relay] WebSocket relay on 0.0.0.0:{PORT}")
-    async with websockets.serve(handler, "0.0.0.0", PORT):
+    async with websockets.serve(handler, "0.0.0.0", PORT, max_size=10_000_000):
         await asyncio.Future()
 
 
